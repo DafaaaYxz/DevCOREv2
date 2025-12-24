@@ -3,6 +3,7 @@ import fetch from 'node-fetch';
 import { config } from '../setting.js';
 
 export default async function handler(req, res) {
+    // Segera balas 200 OK untuk Telegram jika request bukan POST
     if (req.method !== 'POST') return res.status(200).send('Bot is active');
 
     const update = req.body;
@@ -13,45 +14,35 @@ export default async function handler(req, res) {
     const text = update.message.text || "";
     const isOwner = userId === config.owner_id;
 
-    // --- HELPER DATABASE (UPSTASH) ---
+    // --- HELPER DB (UPSTASH) - Dioptimasi ---
     const db = {
-        // Ambil daftar semua key (Array)
-        getKeys: async () => {
-            const res = await fetch(`${config.uptash_url}/get/api_keys`, {
+        async get(key) {
+            const r = await fetch(`${config.uptash_url}/get/${key}`, {
                 headers: { Authorization: `Bearer ${config.uptash_token}` }
             });
-            const data = await res.json();
-            return data.result ? JSON.parse(data.result) : [];
+            const d = await r.json();
+            return d.result;
         },
-        // Simpan daftar key
-        setKeys: async (keysArray) => {
-            await fetch(`${config.uptash_url}/set/api_keys`, {
+        async set(key, val) {
+            await fetch(`${config.uptash_url}/set/${key}`, {
                 method: 'POST',
                 headers: { Authorization: `Bearer ${config.uptash_token}` },
-                body: JSON.stringify(keysArray)
+                body: JSON.stringify(val)
             });
         },
-        // Sesi untuk alur /upkey
-        setSession: async (uid, step) => {
-            await fetch(`${config.uptash_url}/set/session:${uid}/${step}/EX/300`, { // Expire 5 menit
+        async setEx(key, val, seconds) {
+            // Format Upstash REST untuk SET dengan Expiry
+            await fetch(`${config.uptash_url}/set/${key}/${val}/EX/${seconds}`, {
                 headers: { Authorization: `Bearer ${config.uptash_token}` }
             });
         },
-        getSession: async (uid) => {
-            const res = await fetch(`${config.uptash_url}/get/session:${uid}`, {
-                headers: { Authorization: `Bearer ${config.uptash_token}` }
-            });
-            const data = await res.json();
-            return data.result;
-        },
-        clearSession: async (uid) => {
-            await fetch(`${config.uptash_url}/del/session:${uid}`, {
+        async del(key) {
+            await fetch(`${config.uptash_url}/del/${key}`, {
                 headers: { Authorization: `Bearer ${config.uptash_token}` }
             });
         }
     };
 
-    // --- HELPER TELEGRAM ---
     const sendMessage = async (msg) => {
         await fetch(`https://api.telegram.org/bot${config.bot_token}/sendMessage`, {
             method: 'POST',
@@ -61,91 +52,88 @@ export default async function handler(req, res) {
     };
 
     try {
-        const session = await db.getSession(userId);
+        // Ambil status sesi
+        const session = await db.get(`session:${userId}`);
 
-        // --- OWNER COMMANDS ---
+        // 1. OWNER COMMANDS
         if (text === '/upkey' && isOwner) {
-            await db.setSession(userId, 'waiting_for_key');
-            return await sendMessage("Silahkan kirim API Key OpenRouter yang baru:");
+            await db.setEx(`session:${userId}`, 'waiting', 300);
+            return await sendMessage("Silahkan kirim API Key OpenRouter baru:");
         }
 
         if (text === '/listkey' && isOwner) {
-            const keys = await db.getKeys();
-            if (keys.length === 0) return await sendMessage("Belum ada API Key yang tersimpan.");
-            let list = "📑 *LIST API KEYS*\n\n";
-            keys.forEach((k, i) => {
-                list += `${i + 1}. \`${k.substring(0, 12)}...\`\n`;
-            });
-            return await sendMessage(list);
+            const raw = await db.get('api_keys');
+            const keys = raw ? JSON.parse(raw) : [];
+            if (keys.length === 0) return await sendMessage("Kosong.");
+            return await sendMessage(`📑 *List Key:*\n${keys.map((k, i) => `${i+1}. \`${k.substring(0,10)}...\``).join('\n')}`);
         }
-        
+
         if (text === '/clearkey' && isOwner) {
-            await db.setKeys([]);
-            return await sendMessage("✅ Semua API Key berhasil dihapus.");
+            await db.del('api_keys');
+            return await sendMessage("✅ Semua key dihapus.");
         }
 
-        // --- SESSION HANDLER (Untuk /upkey) ---
-        if (session === 'waiting_for_key' && isOwner) {
-            const currentKeys = await db.getKeys();
-            currentKeys.push(text.trim());
-            await db.setKeys(currentKeys);
-            await db.clearSession(userId);
-            return await sendMessage(`✅ Key berhasil ditambahkan!\nTotal key saat ini: ${currentKeys.length}`);
+        // 2. SESSION HANDLER
+        if (session === 'waiting' && isOwner) {
+            const raw = await db.get('api_keys');
+            const keys = raw ? JSON.parse(raw) : [];
+            keys.push(text.trim());
+            await db.set('api_keys', JSON.stringify(keys));
+            await db.del(`session:${userId}`);
+            return await sendMessage("✅ Key berhasil ditambahkan!");
         }
 
-        // --- PUBLIC COMMANDS ---
-        if (text === '/start') {
-            return await sendMessage("🤖 Bot AI Aktif! Kirim pesan apapun untuk mengobrol.");
-        }
-        if (text === '/ping') {
-            return await sendMessage("Pong! 🏓");
-        }
-        if (text === '/info') {
-            return await sendMessage(`👤 *USER INFO*\nID: \`${userId}\`\nStatus: ${isOwner ? "Owner" : "User"}`);
-        }
+        // 3. PUBLIC COMMANDS
+        if (text === '/start') return await sendMessage("Bot Aktif! Kirim pesan untuk Chat AI.");
+        if (text === '/ping') return await sendMessage("Pong! 🏓");
 
-        // --- AI LOGIC (ROTATION SYSTEM) ---
+        // 4. AI LOGIC (Dengan Timeout 8 detik agar tidak 504)
         if (text && !text.startsWith('/')) {
-            const keys = await db.getKeys();
-            if (keys.length === 0) return await sendMessage("⚠️ Maaf, sistem AI sedang offline (No API Keys).");
+            const raw = await db.get('api_keys');
+            const keys = raw ? JSON.parse(raw) : [];
+            if (keys.length === 0) return await sendMessage("⚠️ API Key belum diatur owner.");
 
-            let aiSuccess = false;
-            // Looping untuk mencoba setiap key jika ada yang error/mati
-            for (let i = 0; i < keys.length; i++) {
-                try {
-                    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                        method: "POST",
-                        headers: {
-                            "Authorization": `Bearer ${keys[i]}`,
-                            "Content-Type": "application/json"
-                        },
-                        body: JSON.stringify({
-                            "model": "nex-agi/deepseek-v3.1-nex-n1:free",
-                            "messages": [{ "role": "user", "content": text }]
-                        })
-                    });
+            // Gunakan key terakhir yang baru dimasukkan (atau acak)
+            const activeKey = keys[keys.length - 1]; 
+            
+            // AbortController untuk membatalkan request jika terlalu lama
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000); // 8 detik limit
 
-                    const data = await response.json();
-                    
-                    if (response.ok && data.choices) {
-                        await sendMessage(data.choices[0].message.content);
-                        aiSuccess = true;
-                        break; // Berhenti looping jika sukses
-                    } else {
-                        console.error(`Key index ${i} failed, trying next...`);
-                    }
-                } catch (e) {
-                    continue; // Coba key berikutnya
+            try {
+                const aiRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                    method: "POST",
+                    signal: controller.signal,
+                    headers: {
+                        "Authorization": `Bearer ${activeKey}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        "model": "nex-agi/deepseek-v3.1-nex-n1:free",
+                        "messages": [{ "role": "user", "content": text }]
+                    })
+                });
+
+                clearTimeout(timeout);
+                const data = await aiRes.json();
+                const reply = data.choices?.[0]?.message?.content || "AI tidak memberikan respon.";
+                await sendMessage(reply);
+
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    await sendMessage("⏳ AI terlalu lama merespon (Timeout). Coba lagi beberapa saat lagi.");
+                } else {
+                    await sendMessage("❌ Terjadi kesalahan pada koneksi AI.");
                 }
             }
-
-            if (!aiSuccess) {
-                await sendMessage("❌ Semua API Key sedang bermasalah atau limit. Silahkan hubungi owner.");
-            }
         }
 
+        // Selalu kirim respon ke Vercel agar tidak dianggap macet
         return res.status(200).send('OK');
-    } catch (err) {
+
+    } catch (e) {
+        console.error(e);
+        // Tetap kirim 200 agar Telegram berhenti mengirim ulang (retry)
         return res.status(200).send('OK');
     }
 }
